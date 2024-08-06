@@ -141,7 +141,7 @@ def process_snapshot():
 
             for item in data.get('ac', []):
                 if 'r' not in item:
-                    continue  # Skip this item if 'r' key is not present
+                    continue
 
                 aircraft_id = item['r']
                 flight = item.get('flight', None)
@@ -249,7 +249,7 @@ def process_snapshot():
                             flight_record = cur.fetchone()
 
                             # Call check_takeoff with the new flight_record
-                            if not planes[aircraft_id].is_on_ground:
+                            if planes[aircraft_id].is_on_ground:
                                 check_takeoff(cur, flight_record, new_snapshot_id)
 
                         except Exception as e:
