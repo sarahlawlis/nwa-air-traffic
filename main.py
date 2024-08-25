@@ -14,11 +14,13 @@ logging.basicConfig(level=logging.INFO)
 # Dictionary to track the plane state
 planes = {}
 
+# Main function to rerun process_snapshot every n seconds
 def main():
     while True:
         process_snapshot()
-        time.sleep(10)
+        time.sleep(10) # however many seconds I want between runs
 
+# getting creds for DB connection
 def connect_to_db():
     conn = psycopg2.connect(
         dbname=DB_NAME, 
@@ -27,7 +29,9 @@ def connect_to_db():
         host=DB_HOST)
     return conn
 
+# Function to download API url stuff made to retry if there are issues
 def download(URL, retries=3, delay=5):
+    # loops for however many retries
     for attempt in range(retries):
         try:
             response = requests.get(URL)
@@ -38,6 +42,7 @@ def download(URL, retries=3, delay=5):
             time.sleep(delay)
     return None
 
+# Create dictionary of airport bounds to use for takeoff and landing logic
 airport_bounds = {
     'FYV': Polygon([(35.993452, -94.158442), (35.991369, -94.171840), (36.017515, -94.165646), (36.015293, -94.177069)]),
     'SPZ': Polygon([(36.184300, -94.121102), (36.184161, -94.114488), (36.167603, -94.117838), (36.167741, -94.124279)]),
@@ -46,6 +51,7 @@ airport_bounds = {
     'ROG': Polygon([(36.384020, -94.106592), (36.382178, -94.095432), (36.362153, -94.105602), (36.363536, -94.115050)])
 }
 
+# Function to get airport based on coordinates of plane
 def get_airport(lat, lon):
     point = Point(lat, lon)
     for airport, polygon in airport_bounds.items():
@@ -53,7 +59,8 @@ def get_airport(lat, lon):
             return airport
     return None
 
-def check_takeoff(cur, flight_record, snapshot_id):
+# function with logic checking for takeoff of a unique flight
+def check_takeoff(cur, flight_record):
     first_snapshotid = flight_record[15]
     first_detected_gs = flight_record[3]
     first_detected_alt_baro = flight_record[4]
@@ -63,13 +70,47 @@ def check_takeoff(cur, flight_record, snapshot_id):
 
     airport = get_airport(first_detected_lat, first_detected_lon)
 
-    if airport and (first_detected_alt_baro is None or first_detected_alt_geom is None or first_detected_gs is None or first_detected_gs < 30):
+    if airport and (first_detected_alt_baro is None or first_detected_alt_baro < 2000 or first_detected_alt_geom is None \
+                    or first_detected_alt_geom < 2000 or first_detected_gs is None or first_detected_gs < 30):
+        # Check if a record with the same flightid, airportid, and takeoff_snapshotid already exists
         cur.execute("""
-            INSERT INTO tbl_takeoff (flightid, airportid, takeoff_snapshotid)
-            VALUES (%s, (SELECT airport_id FROM tbl_airports WHERE iata_code = %s), %s)
+            SELECT 1 FROM tbl_takeoff 
+            WHERE flightid = %s AND airportid = (SELECT airport_id FROM tbl_airports WHERE iata_code = %s) 
+            AND takeoff_snapshotid = %s
         """, (flight_record[0], airport, first_snapshotid))
+        exists = cur.fetchone()
 
-def check_landing(cur, flight_record, snapshot_id):
+        if not exists:
+            cur.execute("""
+                INSERT INTO tbl_takeoff (flightid, airportid, takeoff_snapshotid)
+                VALUES (%s, (SELECT airport_id FROM tbl_airports WHERE iata_code = %s), %s)
+            """, (flight_record[0], airport, first_snapshotid))
+
+
+def delete_duplicate_takeoff(cur, flightid, airport):
+    cur.execute("""
+        SELECT takeoffid, takeoff_snapshotid
+        FROM tbl_takeoff
+        WHERE flightid = %s AND airportid = (SELECT airport_id FROM tbl_airports WHERE iata_code = %s)
+        ORDER BY takeoffid DESC
+        LIMIT 2
+    """, (flightid, airport))
+    rows = cur.fetchall()
+
+    if len(rows) == 2:
+        # Delete the older record (with the smaller snapshot ID)
+        if rows[1][1] < rows[0][1]:
+            cur.execute("""
+                DELETE FROM tbl_takeoff
+                WHERE takeoffid = %s
+            """, (rows[1][0],))
+        else:
+            cur.execute("""
+                DELETE FROM tbl_takeoff
+                WHERE takeoffid = %s
+            """, (rows[0][0],))
+
+def check_landing(cur, flight_record):
     last_snapshotid = flight_record[16]
     last_detected_gs = flight_record[9]
     last_detected_alt_baro = flight_record[10]
@@ -79,7 +120,8 @@ def check_landing(cur, flight_record, snapshot_id):
 
     airport = get_airport(last_detected_lat, last_detected_lon)
 
-    if airport and (last_detected_alt_baro is None or last_detected_alt_geom is None or last_detected_gs is None or last_detected_gs < 30):
+    if airport and (last_detected_alt_baro is None or last_detected_alt_baro < 2000 or last_detected_alt_geom is None \
+                    or last_detected_alt_geom < 2000 or last_detected_gs is None or last_detected_gs < 30):
         cur.execute("""
             SELECT 1 FROM tbl_landing WHERE flightid = %s
         """, (flight_record[0],))
@@ -98,9 +140,9 @@ def check_landing(cur, flight_record, snapshot_id):
                 VALUES (%s, (SELECT airport_id FROM tbl_airports WHERE iata_code = %s), %s)
             """, (flight_record[0], airport, last_snapshotid))
 
-        delete_duplicate_landing(cur, flight_record[0], airport, last_snapshotid)
+        delete_duplicate_landing(cur, flight_record[0], airport)
 
-def delete_duplicate_landing(cur, flightid, airport, landing_snapshotid):
+def delete_duplicate_landing(cur, flightid, airport):
     cur.execute("""
         SELECT landingid, landing_snapshotid
         FROM tbl_landing
@@ -110,11 +152,18 @@ def delete_duplicate_landing(cur, flightid, airport, landing_snapshotid):
     """, (flightid, airport))
     rows = cur.fetchall()
 
-    if len(rows) == 2 and rows[1][1] > rows[0][1]:
-        cur.execute("""
-            DELETE FROM tbl_landing
-            WHERE landingid = %s
-        """, (rows[0][0],))
+    if len(rows) == 2:
+        # Delete the older record (with the smaller snapshot ID)
+        if rows[1][1] < rows[0][1]:
+            cur.execute("""
+                DELETE FROM tbl_landing
+                WHERE landingid = %s
+            """, (rows[1][0],))
+        else:
+            cur.execute("""
+                DELETE FROM tbl_landing
+                WHERE landingid = %s
+            """, (rows[0][0],))
 
 def process_snapshot():
     URL = API_URL
@@ -163,7 +212,7 @@ def process_snapshot():
                 
                 if squawk == '':
                     squawk = None
-                
+
                 cur.execute("""
                     INSERT INTO tbl_Aircraft (SnapShotID, AircraftID, flight, t, alt_baro, alt_geom, gs, lat, lon, track, squawk)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -174,11 +223,15 @@ def process_snapshot():
                     if aircraft_id not in planes:
                         planes[aircraft_id] = Plane(aircraft_id)
                     
-                    planes[aircraft_id].update_state(gs, alt_baro, alt_geom)
+                    planes[aircraft_id].update_state(gs, alt_baro, alt_geom, new_snapshot_id)
+
+                    # Check for snapshot gap and reset flight if needed
+                    if planes[aircraft_id].has_snapshot_gap(new_snapshot_id):
+                        flight = None  # Reset the flight tracking to treat it as a new unique flight
 
                 if aircraft_id is not None and flight is not None and squawk is not None:
                     cur.execute("""
-                        SELECT FlightID, first_detected_time, last_detected_time, 
+                        SELECT FlightID, first_detected_time, last_detected_time,
                                first_detected_gs, first_detected_alt_baro, first_detected_alt_geom, 
                                first_detected_lat, first_detected_lon, first_detected_track,
                                last_detected_gs, last_detected_alt_baro, last_detected_alt_geom, 
@@ -208,9 +261,10 @@ def process_snapshot():
                                 WHERE FlightID = %s
                             """, (datetime.now(), gs, alt_baro, alt_geom, lat, lon, track, new_snapshot_id, flight_id))
 
-                            # Call check_landing with new_snapshot_id
-                            if planes[aircraft_id].is_on_ground:
-                                check_landing(cur, flight_record, new_snapshot_id)
+                            if planes[aircraft_id].is_landing():
+                                check_landing(cur, flight_record)
+                            elif planes[aircraft_id].is_takeoff():
+                                check_takeoff(cur, flight_record)
 
                     else:
                         try:
@@ -248,10 +302,6 @@ def process_snapshot():
                             """, (aircraft_id, flight, squawk))
                             flight_record = cur.fetchone()
 
-                            # Call check_takeoff with the new flight_record
-                            if planes[aircraft_id].is_on_ground:
-                                check_takeoff(cur, flight_record, new_snapshot_id)
-
                         except Exception as e:
                             logging.error(f"Error inserting into tbl_uniqueflights: {e}")
 
@@ -265,6 +315,7 @@ def process_snapshot():
         finally:
             if conn:
                 conn.close()
+
 
 if __name__ == "__main__":
     main()
