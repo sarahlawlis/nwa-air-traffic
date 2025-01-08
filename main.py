@@ -5,16 +5,17 @@ import time
 from datetime import datetime
 from shapely.geometry import Point, Polygon
 import logging
+from geopy.distance import geodesic
 from plane import Plane
 from config import DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, API_URL
 
-# Configure logging
+# configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Dictionary to track the plane state
+# dictionary to track the plane state
 planes = {}
 
-# Main function to rerun process_snapshot every n seconds
+# main function to rerun process_snapshot every n seconds
 def main():
     while True:
         process_snapshot()
@@ -29,7 +30,7 @@ def connect_to_db():
         host=DB_HOST)
     return conn
 
-# Function to download API url stuff made to retry if there are issues
+# download API url stuff made to retry if there are issues
 def download(URL, retries=3, delay=5):
     # loops for however many retries
     for attempt in range(retries):
@@ -42,16 +43,28 @@ def download(URL, retries=3, delay=5):
             time.sleep(delay)
     return None
 
-# Create dictionary of airport bounds to use for takeoff and landing logic
+# create dictionary of airport bounds to use for takeoff and landing logic
+# NO LONGER USING THIS DUE TO SWITCH TO GEOFENCING
 airport_bounds = {
-    'FYV': Polygon([(35.993452, -94.158442), (35.991369, -94.171840), (36.017515, -94.165646), (36.015293, -94.177069)]),
+    'FYV': Polygon([(35.977155, -94.141844), (35.953203, -94.179686), (36.042017, -94.198473), (36.043991, -94.164063)]),
     'SPZ': Polygon([(36.184300, -94.121102), (36.184161, -94.114488), (36.167603, -94.117838), (36.167741, -94.124279)]),
     'XNA': Polygon([(36.295641, -94.319638), (36.298795, -94.305666), (36.270152, -94.290206), (36.265723, -94.304463)]),
     'VBT': Polygon([(36.355708, -94.222470), (36.355777, -94.215685), (36.336005, -94.215342), (36.336420, -94.223071)]),
     'ROG': Polygon([(36.384020, -94.106592), (36.382178, -94.095432), (36.362153, -94.105602), (36.363536, -94.115050)])
 }
 
-# Function to get airport based on coordinates of plane
+airport_centers = {
+    'FYV': (36.0034, -94.1719),
+    'ROG': (36.372, -94.107),
+    'XNA': (36.2806, -94.3046),
+    'SPZ': (36.1740, -94.1222),
+    'VBT': (36.3458, -94.2198)
+}
+
+# geofence radius in kilometers
+GEOFENCE_RADIUS = 1
+
+# function to get airport based on coordinates of plane
 def get_airport(lat, lon):
     point = Point(lat, lon)
     for airport, polygon in airport_bounds.items():
@@ -59,34 +72,42 @@ def get_airport(lat, lon):
             return airport
     return None
 
-# function with logic checking for takeoff of a unique flight
-def check_takeoff(cur, flight_record):
-    first_snapshotid = flight_record[15]
-    first_detected_gs = flight_record[3]
-    first_detected_alt_baro = flight_record[4]
-    first_detected_alt_geom = flight_record[5]
-    first_detected_lat = flight_record[6]
-    first_detected_lon = flight_record[7]
+# check proximity to airports using geofencing
+def get_nearby_airport(lat, lon):
+    plane_coords = (lat, lon)
+    for airport, center_coords in airport_centers.items():
+        if geodesic(center_coords, plane_coords).km <= GEOFENCE_RADIUS:
+            return airport
+    return None
 
-    airport = get_airport(first_detected_lat, first_detected_lon)
+def check_takeoff(cur, plane, lat, lon, flight_record):
+    last_snapshotid = flight_record[16]
+    airport = get_nearby_airport(lat, lon)
+    if airport and plane.is_takeoff():
+        logging.info(f"Detected takeoff at {airport} for plane {plane.aircraft_id}")
 
-    if airport and (first_detected_alt_baro is None or first_detected_alt_baro < 2000 or first_detected_alt_geom is None \
-                    or first_detected_alt_geom < 2000 or first_detected_gs is None or first_detected_gs < 30):
-        # Check if a record with the same flightid, airportid, and takeoff_snapshotid already exists
+        # check if the flight exists in tbl_takeoff
         cur.execute("""
-            SELECT 1 FROM tbl_takeoff 
-            WHERE flightid = %s AND airportid = (SELECT airport_id FROM tbl_airports WHERE iata_code = %s) 
-            AND takeoff_snapshotid = %s
-        """, (flight_record[0], airport, first_snapshotid))
+            SELECT 1 FROM tbl_takeoff WHERE flightid = %s
+        """, (flight_record[0],))
         exists = cur.fetchone()
 
-        if not exists:
+        if exists:
+            cur.execute("""
+                UPDATE tbl_takeoff
+                SET airportid = (SELECT airport_id FROM tbl_airports WHERE iata_code = %s),
+                    takeoff_snapshotid = %s
+                WHERE flightid = %s
+            """, (airport, last_snapshotid, flight_record[0]))
+        else:
             cur.execute("""
                 INSERT INTO tbl_takeoff (flightid, airportid, takeoff_snapshotid)
                 VALUES (%s, (SELECT airport_id FROM tbl_airports WHERE iata_code = %s), %s)
-            """, (flight_record[0], airport, first_snapshotid))
+            """, (flight_record[0], airport, last_snapshotid))
 
+        delete_duplicate_takeoff(cur, flight_record[0], airport)
 
+# going back to delete any duplicate takeoff entries
 def delete_duplicate_takeoff(cur, flightid, airport):
     cur.execute("""
         SELECT takeoffid, takeoff_snapshotid
@@ -98,7 +119,7 @@ def delete_duplicate_takeoff(cur, flightid, airport):
     rows = cur.fetchall()
 
     if len(rows) == 2:
-        # Delete the older record (with the smaller snapshot ID)
+        # delete the older record (with the smaller snapshot ID)
         if rows[1][1] < rows[0][1]:
             cur.execute("""
                 DELETE FROM tbl_takeoff
@@ -110,18 +131,13 @@ def delete_duplicate_takeoff(cur, flightid, airport):
                 WHERE takeoffid = %s
             """, (rows[0][0],))
 
-def check_landing(cur, flight_record):
+def check_landing(cur, plane, lat, lon, flight_record):
     last_snapshotid = flight_record[16]
-    last_detected_gs = flight_record[9]
-    last_detected_alt_baro = flight_record[10]
-    last_detected_alt_geom = flight_record[11]
-    last_detected_lat = flight_record[12]
-    last_detected_lon = flight_record[13]
+    airport = get_nearby_airport(lat, lon)
+    if airport and plane.is_landing():
+        logging.info(f"Detected landing at {airport} for plane {plane.aircraft_id}")
 
-    airport = get_airport(last_detected_lat, last_detected_lon)
-
-    if airport and (last_detected_alt_baro is None or last_detected_alt_baro < 2000 or last_detected_alt_geom is None \
-                    or last_detected_alt_geom < 2000 or last_detected_gs is None or last_detected_gs < 30):
+        # check if the flight exists in tbl_landing
         cur.execute("""
             SELECT 1 FROM tbl_landing WHERE flightid = %s
         """, (flight_record[0],))
@@ -153,7 +169,7 @@ def delete_duplicate_landing(cur, flightid, airport):
     rows = cur.fetchall()
 
     if len(rows) == 2:
-        # Delete the older record (with the smaller snapshot ID)
+        # delete the older record (with the smaller snapshot ID)
         if rows[1][1] < rows[0][1]:
             cur.execute("""
                 DELETE FROM tbl_landing
@@ -189,11 +205,14 @@ def process_snapshot():
             conn.commit()
 
             for item in data.get('ac', []):
-                if 'r' not in item:
+                aircraft_id = item.get('r') or item.get('hex')
+                if not aircraft_id or not aircraft_id.strip():
+                    logging.warning(f"Skipping plane due to missing or invalid aircraft_id: {item}")
                     continue
-
-                aircraft_id = item['r']
                 flight = item.get('flight', None)
+                if flight is None or not flight.strip():  # Validate flight
+                    logging.warning(f"Skipping plane {aircraft_id} due to missing or invalid flight value")
+                    continue
                 t = item.get('t', None)
                 alt_baro = item.get('alt_baro', None)
                 try:
@@ -219,15 +238,17 @@ def process_snapshot():
                     RETURNING AircraftRecordID;
                 """, (new_snapshot_id, aircraft_id, flight, t, alt_baro, alt_geom, gs, lat, lon, track, squawk))
                 
+                # update plane states
                 if aircraft_id is not None:
                     if aircraft_id not in planes:
                         planes[aircraft_id] = Plane(aircraft_id)
-                    
+
                     planes[aircraft_id].update_state(gs, alt_baro, alt_geom, new_snapshot_id)
 
-                    # Check for snapshot gap and reset flight if needed
+                    # check for snapshot gap and reset flight if needed
                     if planes[aircraft_id].has_snapshot_gap(new_snapshot_id):
-                        flight = None  # Reset the flight tracking to treat it as a new unique flight
+                        # reset the flight tracking to treat it as a new unique flight
+                        flight = None
 
                 if aircraft_id is not None and flight is not None and squawk is not None:
                     cur.execute("""
@@ -261,10 +282,10 @@ def process_snapshot():
                                 WHERE FlightID = %s
                             """, (datetime.now(), gs, alt_baro, alt_geom, lat, lon, track, new_snapshot_id, flight_id))
 
-                            if planes[aircraft_id].is_landing():
-                                check_landing(cur, flight_record)
-                            elif planes[aircraft_id].is_takeoff():
-                                check_takeoff(cur, flight_record)
+                            # call check_takeoff and check_landing here
+                            if lat is not None and lon is not None:
+                                check_takeoff(cur, planes.get(aircraft_id, Plane(aircraft_id)), lat, lon, flight_record)
+                                check_landing(cur, planes.get(aircraft_id, Plane(aircraft_id)), lat, lon, flight_record)
 
                     else:
                         try:
